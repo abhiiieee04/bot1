@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 CATEGORIES = {
     "config": "⚙️ Config",
-    "combos": "📄 Combos",
+    "combos": "🔀 Combos",
     "valids": "✅ Valids",
 }
 
@@ -202,14 +202,6 @@ class BotHandlers:
         data = query.data
         db = get_db(context)
 
-        # --- Handle Back Button ---
-        if data == "back_to_categories":
-            await query.edit_message_text(
-                "📂 Choose a category to browse:",
-                reply_markup=category_menu(),
-            )
-            return
-
         # Admin chose upload category
         if data.startswith("upload_cat_") and is_admin(user.id):
             category = data.split("upload_cat_", 1)[1]
@@ -254,22 +246,13 @@ class BotHandlers:
             files = db.get_files_by_category(category)
             cat_label = CATEGORIES.get(category, category)
 
-            # Create a reusable Back button keyboard
-            back_markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back to Categories", callback_data="back_to_categories")]
-            ])
-
             if not files:
-                await query.edit_message_text(
-                    f"📭 No files in {cat_label} right now.",
-                    reply_markup=back_markup
-                )
+                await query.edit_message_text(f"📭 No files in {cat_label} right now.")
                 return
 
             await query.edit_message_text(
                 f"{cat_label} — *{len(files)} file(s)*:",
                 parse_mode="Markdown",
-                reply_markup=back_markup  # Attach the back button here
             )
 
             for row in files:
@@ -282,9 +265,6 @@ class BotHandlers:
                     keyboard[0].append(
                         InlineKeyboardButton("🗑 Delete", callback_data=f"del_{row['id']}")
                     )
-                
-                # Attach back button to individual files
-                keyboard.append([InlineKeyboardButton("🔙 Back to Categories", callback_data="back_to_categories")])
 
                 await query.message.reply_text(
                     f"{type_emoji} *{row['file_name']}*{caption_preview}\n"

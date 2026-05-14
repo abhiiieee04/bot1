@@ -26,10 +26,11 @@ class Database:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS files (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    file_id     TEXT    NOT NULL,          -- Telegram file_id
-                    file_type   TEXT    NOT NULL,          -- document/photo/video/audio
+                    file_id     TEXT    NOT NULL,
+                    file_type   TEXT    NOT NULL,
                     file_name   TEXT,
                     caption     TEXT,
+                    category    TEXT    NOT NULL DEFAULT 'config',
                     uploader_id INTEGER NOT NULL,
                     upload_time TEXT    NOT NULL,
                     expiry_time TEXT    NOT NULL,
@@ -43,21 +44,25 @@ class Database:
                     joined_at   TEXT    NOT NULL
                 );
             """)
+            # migrate existing DB if category column is missing
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(files)").fetchall()]
+            if "category" not in cols:
+                conn.execute("ALTER TABLE files ADD COLUMN category TEXT NOT NULL DEFAULT 'config'")
         logger.info("Database initialised.")
 
     # ── File operations ─────────────────────────────────────────────────────
 
     def add_file(self, file_id: str, file_type: str, file_name: str,
-                 caption: str, uploader_id: int) -> int:
+                 caption: str, uploader_id: int, category: str = "config") -> int:
         now = datetime.utcnow()
         expiry = now + timedelta(days=FILE_EXPIRY_DAYS)
         with self._conn() as conn:
             cur = conn.execute(
                 """INSERT INTO files
-                   (file_id, file_type, file_name, caption,
+                   (file_id, file_type, file_name, caption, category,
                     uploader_id, upload_time, expiry_time)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (file_id, file_type, file_name, caption,
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (file_id, file_type, file_name, caption, category,
                  uploader_id, now.isoformat(), expiry.isoformat()),
             )
             return cur.lastrowid
@@ -66,6 +71,13 @@ class Database:
         with self._conn() as conn:
             return conn.execute(
                 "SELECT * FROM files WHERE deleted=0 ORDER BY upload_time DESC"
+            ).fetchall()
+
+    def get_files_by_category(self, category: str):
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM files WHERE deleted=0 AND category=? ORDER BY upload_time DESC",
+                (category,)
             ).fetchall()
 
     def get_file(self, file_db_id: int):

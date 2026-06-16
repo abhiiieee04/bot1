@@ -2,11 +2,16 @@
 handlers.py — All command and message handlers with category folders.
 """
 
+import csv
+import io
+import os
+import asyncio
 import logging
 from datetime import datetime
+from types import SimpleNamespace
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import ContextTypes
 
 from config import ADMIN_IDS, REQUIRED_CHANNELS, FILE_EXPIRY_DAYS
@@ -15,15 +20,17 @@ from database import Database
 logger = logging.getLogger(__name__)
 
 # ── Categories ────────────────────────────────────────────────────────────────
-
 CATEGORIES = {
     "config": "⚙️ Config",
     "combos": "🔀 Combos",
     "valids": "✅ Valids",
 }
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# How long to pause between broadcast sends (seconds).
+# Telegram allows roughly 30 msgs/sec to *different* chats — 0.05s keeps us well under that.
+BROADCAST_DELAY = 0.05
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -66,7 +73,6 @@ def admin_upload_menu() -> InlineKeyboardMarkup:
 
 
 # ── Handler class ─────────────────────────────────────────────────────────────
-
 class BotHandlers:
 
     # /start
@@ -83,6 +89,9 @@ class BotHandlers:
                 "📋 /files — browse files by category\n"
                 "🗑 /delete <id> — remove a file\n"
                 "📊 /stats — bot statistics\n"
+                "📣 /broadcast — message every user\n"
+                "📥 /export — download users as CSV\n"
+                "💾 /backup — download the full database file\n"
                 "❓ /help — help",
                 parse_mode="Markdown",
             )
@@ -110,7 +119,11 @@ class BotHandlers:
                 "📤 Send any file → choose a category\n"
                 "📋 /files — browse by category\n"
                 "🗑 /delete <id> — delete a file\n"
-                "📊 /stats — usage stats\n\n"
+                "📊 /stats — usage stats\n"
+                "📣 /broadcast <text> — preview + confirm before messaging all users\n"
+                "📣 (reply to any message) /broadcast — same, but copies that message\n"
+                "📥 /export — download all users as a CSV file\n"
+                "💾 /backup — download the raw database file (full backup)\n\n"
                 f"Files auto-delete after *{FILE_EXPIRY_DAYS} days*."
             )
         else:
@@ -138,7 +151,6 @@ class BotHandlers:
             return
 
         msg = update.message
-
         if msg.document:
             context.user_data["pending_file"] = {
                 "file_id": msg.document.file_id,
@@ -179,7 +191,6 @@ class BotHandlers:
     # /files — show category picker
     async def list_files(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-
         if not is_admin(user.id):
             missing = await check_membership(user.id, context)
             if missing:
@@ -201,6 +212,40 @@ class BotHandlers:
         user = query.from_user
         data = query.data
         db = get_db(context)
+
+        # Broadcast cancelled
+        if data == "bcast_cancel" and is_admin(user.id):
+            context.bot_data.get("pending_broadcasts", {}).pop(user.id, None)
+            await query.edit_message_text("❌ Broadcast cancelled. No messages were sent.")
+            return
+
+        # Broadcast confirmed — fire it for real
+        if data == "bcast_confirm" and is_admin(user.id):
+            pending = context.bot_data.get("pending_broadcasts", {}).pop(user.id, None)
+            if not pending:
+                await query.edit_message_text(
+                    "⚠️ This broadcast request has expired. Run /broadcast again."
+                )
+                return
+
+            user_ids = db.get_all_user_ids()
+            if not user_ids:
+                await query.edit_message_text("📭 No users to broadcast to.")
+                return
+
+            await query.edit_message_text(f"📣 Starting broadcast to {len(user_ids)} user(s)...")
+
+            source_message = None
+            if pending["source_chat_id"] and pending["source_message_id"]:
+                source_message = SimpleNamespace(
+                    chat_id=pending["source_chat_id"],
+                    message_id=pending["source_message_id"],
+                )
+
+            context.application.create_task(
+                self._run_broadcast(context, query.message, user_ids, source_message, pending["text"])
+            )
+            return
 
         # Admin chose upload category
         if data.startswith("upload_cat_") and is_admin(user.id):
@@ -233,7 +278,6 @@ class BotHandlers:
         # User/admin chose a category to browse
         if data.startswith("cat_"):
             category = data.split("cat_", 1)[1]
-
             if not is_admin(user.id):
                 missing = await check_membership(user.id, context)
                 if missing:
@@ -245,7 +289,6 @@ class BotHandlers:
 
             files = db.get_files_by_category(category)
             cat_label = CATEGORIES.get(category, category)
-
             if not files:
                 await query.edit_message_text(f"📭 No files in {cat_label} right now.")
                 return
@@ -259,13 +302,11 @@ class BotHandlers:
                 expiry_str = fmt_dt(row["expiry_time"])
                 caption_preview = f"\n📝 {row['caption']}" if row["caption"] else ""
                 type_emoji = {"document": "📄", "photo": "🖼", "video": "🎬", "audio": "🎵"}.get(row["file_type"], "📁")
-
                 keyboard = [[InlineKeyboardButton("⬇️ Get File", callback_data=f"get_{row['id']}")]]
                 if is_admin(user.id):
                     keyboard[0].append(
                         InlineKeyboardButton("🗑 Delete", callback_data=f"del_{row['id']}")
                     )
-
                 await query.message.reply_text(
                     f"{type_emoji} *{row['file_name']}*{caption_preview}\n"
                     f"🆔 ID: `{row['id']}` | ⏳ Expires: {expiry_str}",
@@ -293,9 +334,9 @@ class BotHandlers:
 
             send_map = {
                 "document": context.bot.send_document,
-                "photo":    context.bot.send_photo,
-                "video":    context.bot.send_video,
-                "audio":    context.bot.send_audio,
+                "photo": context.bot.send_photo,
+                "video": context.bot.send_video,
+                "audio": context.bot.send_audio,
             }
             sender = send_map.get(row["file_type"], context.bot.send_document)
             kwarg_key = row["file_type"] if row["file_type"] != "document" else "document"
@@ -325,9 +366,11 @@ class BotHandlers:
         if not is_admin(update.effective_user.id):
             await update.message.reply_text("⛔ Admins only.")
             return
+
         if not context.args:
             await update.message.reply_text("Usage: /delete <file_id>")
             return
+
         try:
             file_db_id = int(context.args[0])
         except ValueError:
@@ -348,6 +391,7 @@ class BotHandlers:
         if not is_admin(update.effective_user.id):
             await update.message.reply_text("⛔ Admins only.")
             return
+
         db = get_db(context)
         lines = ["📊 *Bot Stats*", f"👥 Total users: {db.get_user_count()}"]
         for key, label in CATEGORIES.items():
@@ -355,3 +399,170 @@ class BotHandlers:
             lines.append(f"{label}: {count} file(s)")
         lines.append(f"⏳ File expiry: {FILE_EXPIRY_DAYS} days")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    # ── Broadcast ────────────────────────────────────────────────────────────
+    # /broadcast <text>               -> previews plain text, waits for confirmation
+    # (reply to a message) /broadcast -> previews that message (any type), waits for confirmation
+    async def broadcast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if not is_admin(user.id):
+            await update.message.reply_text("⛔ Admins only.")
+            return
+
+        db = get_db(context)
+        user_ids = db.get_all_user_ids()
+        if not user_ids:
+            await update.message.reply_text("📭 No users to broadcast to yet.")
+            return
+
+        source_message = update.message.reply_to_message
+        text_arg = " ".join(context.args) if context.args else None
+
+        if not source_message and not text_arg:
+            await update.message.reply_text(
+                "Usage:\n"
+                "• `/broadcast <message>` — sends plain text\n"
+                "• Reply to any message (text, photo, file, etc.) with `/broadcast` "
+                "— copies it as-is to every user",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Stash what we're about to send, keyed by this admin, until they confirm or cancel.
+        context.bot_data.setdefault("pending_broadcasts", {})[user.id] = {
+            "text": text_arg,
+            "source_chat_id": source_message.chat_id if source_message else None,
+            "source_message_id": source_message.message_id if source_message else None,
+        }
+
+        confirm_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Confirm & Send", callback_data="bcast_confirm"),
+            InlineKeyboardButton("❌ Cancel", callback_data="bcast_cancel"),
+        ]])
+
+        if source_message:
+            # Show exactly what will go out by copying it back to the admin first.
+            await context.bot.copy_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=source_message.chat_id,
+                message_id=source_message.message_id,
+            )
+            await update.message.reply_text(
+                f"👆 That's the preview. Send it to *{len(user_ids)} user(s)*?",
+                parse_mode="Markdown",
+                reply_markup=confirm_kb,
+            )
+        else:
+            await update.message.reply_text(
+                f"📣 *Preview:*\n\n{text_arg}\n\n"
+                f"Send this to *{len(user_ids)} user(s)*?",
+                parse_mode="Markdown",
+                reply_markup=confirm_kb,
+            )
+
+    async def _run_broadcast(self, context, status_msg, user_ids, source_message, text_arg):
+        sent = 0
+        blocked = 0
+        failed = 0
+        total = len(user_ids)
+
+        for i, uid in enumerate(user_ids, start=1):
+            try:
+                if source_message:
+                    await context.bot.copy_message(
+                        chat_id=uid,
+                        from_chat_id=source_message.chat_id,
+                        message_id=source_message.message_id,
+                    )
+                else:
+                    await context.bot.send_message(chat_id=uid, text=text_arg)
+                sent += 1
+            except Forbidden:
+                # User blocked the bot or deleted their account — expected over time, not an error.
+                blocked += 1
+            except BadRequest as e:
+                logger.warning("Broadcast BadRequest for %s: %s", uid, e)
+                failed += 1
+            except Exception as e:
+                logger.error("Broadcast error for %s: %s", uid, e)
+                failed += 1
+
+            if i % 25 == 0 or i == total:
+                try:
+                    await status_msg.edit_text(
+                        f"📣 Broadcasting... {i}/{total}\n"
+                        f"✅ Sent: {sent}  🚫 Blocked: {blocked}  ❌ Failed: {failed}"
+                    )
+                except Exception:
+                    pass  # message may be unchanged or rate-limited; ignore
+
+            await asyncio.sleep(BROADCAST_DELAY)
+
+        try:
+            await status_msg.edit_text(
+                "✅ *Broadcast complete!*\n"
+                f"📨 Sent: {sent}\n"
+                f"🚫 Blocked (left/blocked bot): {blocked}\n"
+                f"❌ Failed: {failed}\n"
+                f"👥 Total attempted: {total}",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        logger.info("Broadcast finished — sent=%s blocked=%s failed=%s", sent, blocked, failed)
+
+    # ── Export / backup ─────────────────────────────────────────────────────
+    # /export — CSV of user_id, username, first_name, joined_at
+    async def export_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("⛔ Admins only.")
+            return
+
+        db = get_db(context)
+        users = db.get_all_users()
+        if not users:
+            await update.message.reply_text("📭 No users stored yet.")
+            return
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["user_id", "username", "first_name", "joined_at"])
+        for row in users:
+            writer.writerow([row["user_id"], row["username"], row["first_name"], row["joined_at"]])
+
+        data = io.BytesIO(buf.getvalue().encode("utf-8"))
+        filename = f"users_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+
+        await update.message.reply_document(
+            document=data,
+            filename=filename,
+            caption=f"👥 {len(users)} user(s) exported.",
+        )
+
+    # /backup — raw SQLite DB file (users + files, everything)
+    async def export_db(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("⛔ Admins only.")
+            return
+
+        db = get_db(context)
+        db_path = db.path
+        if not os.path.exists(db_path):
+            await update.message.reply_text("❌ Database file not found on disk.")
+            return
+
+        try:
+            with open(db_path, "rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=f"file_vault_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db",
+                    caption=(
+                        "💾 Full database backup (users + file metadata).\n"
+                        "To restore on a new host: place this file at your DB_PATH "
+                        "(e.g. `/data/file_vault.db`) before starting the bot, and it "
+                        "will pick up right where it left off — no users lost."
+                    ),
+                )
+        except Exception as e:
+            logger.error("Failed to export DB file: %s", e)
+            await update.message.reply_text("❌ Couldn't export the database file.")

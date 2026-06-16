@@ -113,6 +113,9 @@ class BotHandlers:
                 "📂 /files — browse files by category\n"
                 "🗑 /delete <id> — remove a file\n"
                 "📊 /stats — bot statistics\n"
+                "📣 /broadcast — message every user\n"
+                "📥 /export — download users as CSV\n"
+                "💾 /backup — download full database\n"
                 "❓ /help — help",
                 parse_mode="Markdown",
             )

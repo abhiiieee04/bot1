@@ -1,14 +1,12 @@
 """
 Telegram File Vault Bot
-- Admins upload files; files expire after 3 days
-- Users must join required channels/groups to access files
+- Owner manages admins; only owner can broadcast/export/backup
+- Admins upload and manage files
+- Users must join required channels to access files
 - Automatic cleanup of expired files
 """
 
-import asyncio
 import logging
-from datetime import datetime
-
 from telegram import Update, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from telegram.ext import (
     Application,
@@ -19,7 +17,7 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
-from config import BOT_TOKEN, ADMIN_IDS, REQUIRED_CHANNELS
+from config import BOT_TOKEN, OWNER_ID
 from database import Database
 from handlers import BotHandlers
 from scheduler import start_scheduler
@@ -30,49 +28,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Commands every user sees in the "/" menu.
+# Commands every user sees
 PUBLIC_COMMANDS = [
     BotCommand("start", "Get started / check access"),
     BotCommand("files", "Browse available files"),
-    BotCommand("help", "Show help"),
+    BotCommand("help",  "Show help"),
 ]
 
-# Extra commands only admins see in their own "/" menu.
+# Extra commands admins see
 ADMIN_ONLY_COMMANDS = [
-    BotCommand("upload", "How to upload a file"),
-    BotCommand("delete", "Delete a file by ID"),
-    BotCommand("stats", "Bot statistics"),
+    BotCommand("upload",    "How to upload a file"),
+    BotCommand("delete",    "Delete a file by ID"),
+    BotCommand("stats",     "Bot statistics"),
     BotCommand("broadcast", "Message every user (with confirmation)"),
-    BotCommand("export", "Export users as a CSV file"),
-    BotCommand("backup", "Download full database backup"),
+    BotCommand("export",    "Export users as CSV"),
+    BotCommand("backup",    "Download full database backup"),
+]
+
+# Commands only the owner sees (admin management)
+OWNER_ONLY_COMMANDS = [
+    BotCommand("addadmin",    "Add a new admin"),
+    BotCommand("removeadmin", "Remove an admin"),
+    BotCommand("listadmins",  "List all admins"),
 ]
 
 
 async def post_init(application: Application) -> None:
-    """Initialize database, scheduler, and per-role command menus after app starts."""
     db = Database()
     db.init_db()
     application.bot_data["db"] = db
     await start_scheduler(application)
 
-    # Everyone gets the plain public menu by default.
+    # Default menu for everyone
     await application.bot.set_my_commands(PUBLIC_COMMANDS, scope=BotCommandScopeDefault())
 
-    # Admins additionally get the admin commands, but only inside their own
-    # private chat with the bot — this only changes what's *listed* in the
-    # "/" menu; is_admin() checks inside each handler are the real gate.
-    for admin_id in ADMIN_IDS:
+    # Owner gets everything
+    try:
+        await application.bot.set_my_commands(
+            PUBLIC_COMMANDS + ADMIN_ONLY_COMMANDS + OWNER_ONLY_COMMANDS,
+            scope=BotCommandScopeChat(chat_id=OWNER_ID),
+        )
+    except Exception as e:
+        logger.warning("Could not set owner command menu: %s", e)
+
+    # Existing admins from DB get the admin menu
+    for admin_id in db.get_admin_ids():
         try:
             await application.bot.set_my_commands(
                 PUBLIC_COMMANDS + ADMIN_ONLY_COMMANDS,
                 scope=BotCommandScopeChat(chat_id=admin_id),
             )
         except Exception as e:
-            # Fails if the admin hasn't opened a chat with the bot yet — harmless,
-            # it'll succeed next restart after they /start it once.
             logger.warning("Could not set admin command menu for %s: %s", admin_id, e)
 
-    logger.info("Bot initialized successfully.")
+    logger.info("Bot initialised. Owner: %s", OWNER_ID)
 
 
 def main():
@@ -83,31 +92,36 @@ def main():
         .build()
     )
 
-    handlers_obj = BotHandlers()
+    h = BotHandlers()
 
-    # Commands
-    app.add_handler(CommandHandler("start", handlers_obj.start))
-    app.add_handler(CommandHandler("files", handlers_obj.list_files))
-    app.add_handler(CommandHandler("upload", handlers_obj.upload_prompt))
-    app.add_handler(CommandHandler("delete", handlers_obj.delete_file))
-    app.add_handler(CommandHandler("stats", handlers_obj.stats))
-    app.add_handler(CommandHandler("help", handlers_obj.help_command))
-    app.add_handler(CommandHandler("broadcast", handlers_obj.broadcast))
-    app.add_handler(CommandHandler("export", handlers_obj.export_users))
-    app.add_handler(CommandHandler("backup", handlers_obj.export_db))
+    # Public
+    app.add_handler(CommandHandler("start", h.start))
+    app.add_handler(CommandHandler("files", h.list_files))
+    app.add_handler(CommandHandler("help",  h.help_command))
 
-    # File uploads from admins
-    app.add_handler(
-        MessageHandler(
-            filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO,
-            handlers_obj.handle_file_upload,
-        )
-    )
+    # Admin + owner
+    app.add_handler(CommandHandler("upload", h.upload_prompt))
+    app.add_handler(CommandHandler("delete", h.delete_file))
+    app.add_handler(CommandHandler("stats",  h.stats))
 
-    # Inline button callbacks
-    app.add_handler(CallbackQueryHandler(handlers_obj.handle_callback))
+    # Owner only
+    app.add_handler(CommandHandler("addadmin",    h.add_admin))
+    app.add_handler(CommandHandler("removeadmin", h.remove_admin))
+    app.add_handler(CommandHandler("listadmins",  h.list_admins))
+    app.add_handler(CommandHandler("broadcast",   h.broadcast))
+    app.add_handler(CommandHandler("export",      h.export_users))
+    app.add_handler(CommandHandler("backup",      h.export_db))
 
-    logger.info("Bot started. Press Ctrl+C to stop.")
+    # File uploads
+    app.add_handler(MessageHandler(
+        filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO,
+        h.handle_file_upload,
+    ))
+
+    # Inline buttons
+    app.add_handler(CallbackQueryHandler(h.handle_callback))
+
+    logger.info("Bot started.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

@@ -9,7 +9,7 @@ import asyncio
 import logging
 from datetime import datetime
 
-from telegram import Update
+from telegram import Update, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -30,13 +30,48 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Commands every user sees in the "/" menu.
+PUBLIC_COMMANDS = [
+    BotCommand("start", "Get started / check access"),
+    BotCommand("files", "Browse available files"),
+    BotCommand("help", "Show help"),
+]
+
+# Extra commands only admins see in their own "/" menu.
+ADMIN_ONLY_COMMANDS = [
+    BotCommand("upload", "How to upload a file"),
+    BotCommand("delete", "Delete a file by ID"),
+    BotCommand("stats", "Bot statistics"),
+    BotCommand("broadcast", "Message every user (with confirmation)"),
+    BotCommand("export", "Export users as a CSV file"),
+    BotCommand("backup", "Download full database backup"),
+]
+
 
 async def post_init(application: Application) -> None:
-    """Initialize database and scheduler after app starts."""
+    """Initialize database, scheduler, and per-role command menus after app starts."""
     db = Database()
     db.init_db()
     application.bot_data["db"] = db
     await start_scheduler(application)
+
+    # Everyone gets the plain public menu by default.
+    await application.bot.set_my_commands(PUBLIC_COMMANDS, scope=BotCommandScopeDefault())
+
+    # Admins additionally get the admin commands, but only inside their own
+    # private chat with the bot — this only changes what's *listed* in the
+    # "/" menu; is_admin() checks inside each handler are the real gate.
+    for admin_id in ADMIN_IDS:
+        try:
+            await application.bot.set_my_commands(
+                PUBLIC_COMMANDS + ADMIN_ONLY_COMMANDS,
+                scope=BotCommandScopeChat(chat_id=admin_id),
+            )
+        except Exception as e:
+            # Fails if the admin hasn't opened a chat with the bot yet — harmless,
+            # it'll succeed next restart after they /start it once.
+            logger.warning("Could not set admin command menu for %s: %s", admin_id, e)
+
     logger.info("Bot initialized successfully.")
 
 
@@ -57,6 +92,9 @@ def main():
     app.add_handler(CommandHandler("delete", handlers_obj.delete_file))
     app.add_handler(CommandHandler("stats", handlers_obj.stats))
     app.add_handler(CommandHandler("help", handlers_obj.help_command))
+    app.add_handler(CommandHandler("broadcast", handlers_obj.broadcast))
+    app.add_handler(CommandHandler("export", handlers_obj.export_users))
+    app.add_handler(CommandHandler("backup", handlers_obj.export_db))
 
     # File uploads from admins
     app.add_handler(

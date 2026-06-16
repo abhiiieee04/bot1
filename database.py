@@ -1,5 +1,5 @@
 """
-database.py — SQLite persistence for files and users.
+database.py — SQLite persistence for files, users, and dynamic admins.
 """
 
 import sqlite3
@@ -20,39 +20,71 @@ class Database:
         conn.row_factory = sqlite3.Row
         return conn
 
-    # ── Schema ──────────────────────────────────────────────────────────────
+    # ── Schema ───────────────────────────────────────────────────────────────
     def init_db(self):
         with self._conn() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS files (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    file_id TEXT NOT NULL,
-                    file_type TEXT NOT NULL,
-                    file_name TEXT,
-                    caption TEXT,
-                    category TEXT NOT NULL DEFAULT 'config',
-                    uploader_id INTEGER NOT NULL,
-                    upload_time TEXT NOT NULL,
-                    expiry_time TEXT NOT NULL,
-                    deleted INTEGER NOT NULL DEFAULT 0
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_id      TEXT    NOT NULL,
+                    file_type    TEXT    NOT NULL,
+                    file_name    TEXT,
+                    caption      TEXT,
+                    category     TEXT    NOT NULL DEFAULT 'config',
+                    uploader_id  INTEGER NOT NULL,
+                    upload_time  TEXT    NOT NULL,
+                    expiry_time  TEXT    NOT NULL,
+                    deleted      INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
+                    user_id    INTEGER PRIMARY KEY,
+                    username   TEXT,
                     first_name TEXT,
-                    joined_at TEXT NOT NULL
+                    joined_at  TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS admins (
+                    user_id    INTEGER PRIMARY KEY,
+                    username   TEXT,
+                    first_name TEXT,
+                    added_at   TEXT NOT NULL
                 );
             """)
-            # migrate existing DB if category column is missing
+            # migrate: add category column if missing from old installs
             cols = [r[1] for r in conn.execute("PRAGMA table_info(files)").fetchall()]
             if "category" not in cols:
                 conn.execute("ALTER TABLE files ADD COLUMN category TEXT NOT NULL DEFAULT 'config'")
         logger.info("Database initialised.")
 
-    # ── File operations ─────────────────────────────────────────────────────
+    # ── Admin management ─────────────────────────────────────────────────────
+    def add_admin(self, user_id: int, username: str, first_name: str):
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO admins (user_id, username, first_name, added_at) VALUES (?,?,?,?)",
+                (user_id, username, first_name, datetime.utcnow().isoformat()),
+            )
+
+    def remove_admin(self, user_id: int):
+        with self._conn() as conn:
+            conn.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
+
+    def get_admin_ids(self) -> list:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT user_id FROM admins").fetchall()
+        return [r["user_id"] for r in rows]
+
+    def get_all_admins(self):
+        with self._conn() as conn:
+            return conn.execute("SELECT * FROM admins ORDER BY added_at").fetchall()
+
+    def is_admin(self, user_id: int) -> bool:
+        with self._conn() as conn:
+            row = conn.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,)).fetchone()
+        return row is not None
+
+    # ── File operations ──────────────────────────────────────────────────────
     def add_file(self, file_id: str, file_type: str, file_name: str,
                  caption: str, uploader_id: int, category: str = "config") -> int:
-        now = datetime.utcnow()
+        now    = datetime.utcnow()
         expiry = now + timedelta(days=FILE_EXPIRY_DAYS)
         with self._conn() as conn:
             cur = conn.execute(
@@ -75,7 +107,7 @@ class Database:
         with self._conn() as conn:
             return conn.execute(
                 "SELECT * FROM files WHERE deleted=0 AND category=? ORDER BY upload_time DESC",
-                (category,)
+                (category,),
             ).fetchall()
 
     def get_file(self, file_db_id: int):
@@ -86,9 +118,7 @@ class Database:
 
     def mark_deleted(self, file_db_id: int):
         with self._conn() as conn:
-            conn.execute(
-                "UPDATE files SET deleted=1 WHERE id=?", (file_db_id,)
-            )
+            conn.execute("UPDATE files SET deleted=1 WHERE id=?", (file_db_id,))
 
     def get_expired_files(self):
         now = datetime.utcnow().isoformat()
@@ -103,12 +133,11 @@ class Database:
             self.mark_deleted(row["id"])
         return len(expired)
 
-    # ── User operations ─────────────────────────────────────────────────────
+    # ── User operations ──────────────────────────────────────────────────────
     def register_user(self, user_id: int, username: str, first_name: str):
         with self._conn() as conn:
             conn.execute(
-                """INSERT OR IGNORE INTO users (user_id, username, first_name, joined_at)
-                   VALUES (?,?,?,?)""",
+                "INSERT OR IGNORE INTO users (user_id, username, first_name, joined_at) VALUES (?,?,?,?)",
                 (user_id, username, first_name, datetime.utcnow().isoformat()),
             )
 
@@ -117,17 +146,13 @@ class Database:
             return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
     def get_all_user_ids(self) -> list:
-        """All user_ids that have ever started the bot — used for broadcasts."""
         with self._conn() as conn:
             rows = conn.execute("SELECT user_id FROM users").fetchall()
         return [row["user_id"] for row in rows]
 
     def get_all_users(self):
-        """Full user rows (user_id, username, first_name, joined_at) — used for export."""
         with self._conn() as conn:
-            return conn.execute(
-                "SELECT * FROM users ORDER BY joined_at"
-            ).fetchall()
+            return conn.execute("SELECT * FROM users ORDER BY joined_at").fetchall()
 
     def get_active_file_count(self) -> int:
         with self._conn() as conn:

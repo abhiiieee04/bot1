@@ -29,7 +29,7 @@ async def start_scheduler(application: Application) -> None:
     job_queue.run_repeating(
         purge_job,
         interval=PURGE_INTERVAL_SECONDS,
-        first=10,  # first run 10 seconds after bot starts
+        first=10,
         name="purge_expired_files",
     )
     logger.info("Purge scheduler started (every %ds).", PURGE_INTERVAL_SECONDS)
